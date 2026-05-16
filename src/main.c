@@ -59,6 +59,15 @@
 #define MC707_OUT_CHANNELS     6
 #define MC707_IN_CHANNELS      20
 
+/* Per-substream state: which USB interface backs this PCM substream,
+ * what alt we're currently on, and (once alt 1 is active) the iso
+ * endpoint descriptor we'll feed to URBs in M3. */
+struct mc707_substream {
+	struct usb_interface         *intf;        /* iface 1 (out) or 2 (in) */
+	struct usb_endpoint_descriptor *ep_desc;   /* set after alt switch */
+	bool                          alt_active;  /* alt 1 vs alt 0 */
+};
+
 /* Per-USB-device state. One mc707_dev exists per plugged MC-707,
  * shared by all its bound interfaces. Lives in card->private_data; freed
  * automatically when the snd_card is freed.
@@ -79,7 +88,15 @@ struct mc707_dev {
 
 	/* PCM (iface 1 = playback, iface 2 = capture) */
 	struct snd_pcm     *pcm;
+	struct mc707_substream playback;     /* iface 1 */
+	struct mc707_substream capture;      /* iface 2 */
 };
+
+/* Alt-setting we drive each audio interface to when streaming. Both
+ * iface 1 and iface 2 declare alt 1 as the "full bandwidth" alt
+ * (160 B / 524 B packets) and alt 2 as a 56-byte fallback we never use. */
+#define MC707_AUDIO_ALT_ACTIVE  1
+#define MC707_AUDIO_ALT_IDLE    0
 
 static DEFINE_MUTEX(mc707_devices_lock);
 static LIST_HEAD(mc707_devices_list);
@@ -142,17 +159,105 @@ static const struct snd_pcm_hardware mc707_pcm_hw_capture = {
 	.periods_max      = 64,
 };
 
+static struct mc707_substream *mc707_sub_for(struct snd_pcm_substream *s)
+{
+	struct mc707_dev *d = s->pcm->private_data;
+
+	return (s->stream == SNDRV_PCM_STREAM_PLAYBACK) ? &d->playback : &d->capture;
+}
+
+/* Activate alt 1 on this substream's USB interface and find the iso
+ * endpoint descriptor (the one we'll drive in M3). */
+static int mc707_activate_alt(struct mc707_substream *sub,
+			      struct mc707_dev *d, bool playback)
+{
+	struct usb_host_interface *alt;
+	int i, err;
+
+	if (!sub->intf) {
+		dev_err(&d->udev->dev,
+			"MC-707: %s open with no matching interface bound\n",
+			playback ? "playback" : "capture");
+		return -ENODEV;
+	}
+	if (sub->alt_active)
+		return 0;
+
+	err = usb_set_interface(d->udev,
+				sub->intf->cur_altsetting->desc.bInterfaceNumber,
+				MC707_AUDIO_ALT_ACTIVE);
+	if (err < 0) {
+		dev_err(&sub->intf->dev,
+			"MC-707: usb_set_interface(alt=%d) failed: %d\n",
+			MC707_AUDIO_ALT_ACTIVE, err);
+		return err;
+	}
+
+	/* Find the single iso endpoint exposed by alt 1. */
+	alt = sub->intf->cur_altsetting;
+	sub->ep_desc = NULL;
+	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
+		struct usb_endpoint_descriptor *e = &alt->endpoint[i].desc;
+		if (usb_endpoint_xfer_isoc(e)) {
+			sub->ep_desc = e;
+			break;
+		}
+	}
+	if (!sub->ep_desc) {
+		dev_err(&sub->intf->dev,
+			"MC-707: no iso endpoint found on alt %d\n",
+			MC707_AUDIO_ALT_ACTIVE);
+		usb_set_interface(d->udev,
+				  sub->intf->cur_altsetting->desc.bInterfaceNumber,
+				  MC707_AUDIO_ALT_IDLE);
+		return -ENODEV;
+	}
+
+	sub->alt_active = true;
+	dev_info(&sub->intf->dev,
+		 "MC-707: %s alt %d active — iso EP 0x%02x, mps %u, bInterval %u\n",
+		 playback ? "playback" : "capture",
+		 MC707_AUDIO_ALT_ACTIVE,
+		 sub->ep_desc->bEndpointAddress,
+		 usb_endpoint_maxp(sub->ep_desc),
+		 sub->ep_desc->bInterval);
+	return 0;
+}
+
+static void mc707_deactivate_alt(struct mc707_substream *sub,
+				 struct mc707_dev *d)
+{
+	if (!sub->alt_active || !sub->intf)
+		return;
+	usb_set_interface(d->udev,
+			  sub->intf->cur_altsetting->desc.bInterfaceNumber,
+			  MC707_AUDIO_ALT_IDLE);
+	sub->ep_desc = NULL;
+	sub->alt_active = false;
+}
+
 static int mc707_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct mc707_dev *d = substream->pcm->private_data;
+	bool playback = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
+	struct mc707_substream *sub = mc707_sub_for(substream);
+	int err;
 
-	runtime->hw = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		      ? mc707_pcm_hw_playback : mc707_pcm_hw_capture;
+	runtime->hw = playback ? mc707_pcm_hw_playback : mc707_pcm_hw_capture;
+
+	err = mc707_activate_alt(sub, d, playback);
+	if (err < 0)
+		return err;
 	return 0;
 }
 
 static int mc707_pcm_close(struct snd_pcm_substream *substream)
 {
+	struct mc707_dev *d = substream->pcm->private_data;
+	struct mc707_substream *sub = mc707_sub_for(substream);
+
+	mc707_deactivate_alt(sub, d);
 	return 0;
 }
 
@@ -241,6 +346,7 @@ static int mc707_attach_midi(struct usb_interface *intf, struct mc707_dev *d)
 static int mc707_attach_audio(struct usb_interface *intf, struct mc707_dev *d,
 			      bool is_playback)
 {
+	struct mc707_substream *sub = is_playback ? &d->playback : &d->capture;
 	int err;
 
 	err = mc707_create_pcm(d);
@@ -248,6 +354,9 @@ static int mc707_attach_audio(struct usb_interface *intf, struct mc707_dev *d,
 		dev_err(&intf->dev, "MC-707: snd_pcm_new failed: %d\n", err);
 		return err;
 	}
+	sub->intf = intf;
+	sub->alt_active = false;
+	sub->ep_desc = NULL;
 
 	dev_info(&intf->dev,
 		 "MC-707: audio %s claimed (iface %u) — %u ch × 24-bit × %u Hz (streaming pending M3)\n",
@@ -400,10 +509,17 @@ static void mc707_disconnect(struct usb_interface *intf)
 		snd_usbmidi_disconnect(&d->midi_list);
 		break;
 	case MC707_AUDIO_OUT_IFNUM:
+		/* Clear our pointer into this interface so PCM open can't
+		 * touch it after disconnect. The PCM itself stays alive
+		 * with the snd_card until the last interface is gone. */
+		d->playback.intf = NULL;
+		d->playback.ep_desc = NULL;
+		d->playback.alt_active = false;
+		break;
 	case MC707_AUDIO_IN_IFNUM:
-		/* M2: nothing to tear down per-iface — the PCM device
-		 * lives with the snd_card and is freed below when the
-		 * last interface disconnects. */
+		d->capture.intf = NULL;
+		d->capture.ep_desc = NULL;
+		d->capture.alt_active = false;
 		break;
 	}
 
