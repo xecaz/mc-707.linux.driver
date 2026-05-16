@@ -312,6 +312,105 @@ helpers.** So the SetupPacket bytes (bRequestType, bRequest, wValue,
 wIndex) live one layer up — in the functions that call these helpers.
 That's the next decompile target.
 
+### Complete URB inventory in RDWM1207.SYS
+
+Scanning the entire decompiled binary for URB build sites (any
+`*(uint32_t *)x = imm32` where the immediate is a plausible
+`(URB_FUNCTION << 16) | URB_LENGTH` and the surrounding function
+calls a URB submit helper) yields just **5 build sites in 4
+functions**:
+
+| Function | URB type | Length | Sites |
+|----------|----------|-------:|------:|
+| `FUN_14000ecc0` | `URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE` (`0x0b`) | 0x88 | 2 |
+| `FUN_14000f7e0` | `URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE` (`0x0b`) | 0x88 | 1 |
+| `FUN_1400162d0` | `URB_FUNCTION_RESET_PIPE`               (`0x1e`) | 0x28 | 1 |
+| **`FUN_1400169b0`** | **`URB_FUNCTION_VENDOR_DEVICE`** (`0x17`) | **0x88** | **1** |
+
+That's it. **The entire driver has exactly ONE direct vendor
+control transfer at the raw-URB level.** Everything else is either:
+
+- Device init (GET_DESCRIPTOR_FROM_DEVICE) during enumeration.
+- Pipe reset (RESET_PIPE).
+- **PortClass-handled** — routed through `PcDispatchIrp`, KSPORT
+  objects, and internal `guard_dispatch_icall` indirect calls. PortClass
+  manages iso pipe setup and audio control internally; the
+  USB-level transfers it does don't appear at our analysis layer.
+
+### The one vendor control transfer we know
+
+In `FUN_1400169b0` case `0x222144` (decompile recovered cleanly):
+
+```c
+URB *urb = ExAllocatePool(NonPagedPoolNx, 0x88);
+memset(urb, 0, 0x88);
+*(uint32_t *)urb        = 0x00170088;  // Length=0x88, Function=0x17 (VENDOR_DEVICE)
+urb[8]                  = 0;            // PipeHandle = 0 (default control pipe, EP0)
+*(uint16_t *)(urb+0x80) = 0x0200;       // RequestTypeReservedBits=0x00, bRequest=0x02
+*(uint16_t *)(urb+0x82) = user_buf[2];  // wValue = 16-bit from user input buffer +4
+*(uint16_t *)(urb+0x84) = 0;            // wIndex = 0
+// no TransferBuffer/TransferBufferLength set (wLength = 0)
+FUN_14000e000(dev_ext, urb);            // sync submit
+ExFreePool(urb);
+```
+
+So on the wire this becomes:
+
+```
+USB SETUP packet:
+  bmRequestType = 0x40       (host-to-device, vendor, recipient=device)
+  bRequest      = 0x02
+  wValue        = <16-bit from user input buffer +4>
+  wIndex        = 0x0000
+  wLength       = 0
+no data stage.
+```
+
+This **single** vendor command is reachable via IOCTL `0x222144`,
+which `RDAS1207.DLL` does not call (it's in the "extra" set the
+dispatcher accepts beyond what the ASIO DLL ever issues). Probably
+used by `RDDP1207.EXE` (the daemon) or another tool. Its precise
+semantics are unknown without further RE — likely a power / mode /
+test command rather than the audio-init core.
+
+### The bigger M2 win: audio interfaces are UAC1 underneath
+
+Re-reading the USB descriptors with fresh eyes after the Ghidra
+session:
+
+- **Interface 1 alt 1**: class-specific subtype `0x02` descriptor
+  `0b 24 02 01 06 04 18 01 44 ac 00` decodes to a **standard
+  UAC1 Type I Format**: `bFormatType=1`, `bNrChannels=6`,
+  `bSubframeSize=4`, `bBitResolution=24`, `bSamFreqType=1` (one
+  discrete frequency), `tSamFreq=0x00ac44 = 44100 Hz`.
+- **Interface 2 alt 1**: same format header but `bNrChannels=20`.
+
+The wrapping `bInterfaceClass=0xFF` (vendor) hides these from
+`snd-usb-audio`, but the descriptor content is **standard USB
+Audio Class 1.0 Type I Format**. The `06 24 f1 04 16 00` is a
+Roland-specific extension (subtype `0xF1`, 4 data bytes) sitting
+alongside the standard UAC1 descriptors.
+
+**Implication for our Linux driver:**
+
+- Sample-rate negotiation does NOT need a custom vendor protocol.
+  The device is essentially a UAC1 device with a vendor-class
+  wrapper. Standard UAC1 sample-rate control transfers
+  (`SET_CUR` on the Sampling Frequency endpoint control,
+  `bRequest=0x01`, `wValue=(CS_SAM_FREQ_CONTROL<<8)`, etc.)
+  should work — they bypass the `0xFF` class wrapper because
+  they target the endpoint and entity directly.
+- The 9-rate table in `RDAS1207.DLL` represents what the
+  *driver software* supports as a superset across the
+  `usbdrv8oq` framework, not necessarily what the device
+  accepts. The single declared rate (44.1 kHz) may actually be
+  all the MC-707 supports; the higher rates in the table apply
+  to other products like Studio-Capture.
+- M2 design simplifies dramatically: claim the audio interfaces
+  ourselves, parse them as if UAC1, set up iso streaming using
+  the standard UAC1 endpoint state machine. Reuse the kernel's
+  `snd-usbmidi-lib` pattern we already use for MIDI.
+
 ## Open questions for the next RE pass
 
 1. ✅ **Partial**: 10 of 24 IOCTLs mapped to ASIO methods via direct-call
