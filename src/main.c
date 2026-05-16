@@ -29,8 +29,24 @@
 #define USB_PID_MC707    0x0229
 
 #define MC707_MIDI_IFNUM   3
-#define MC707_MIDI_OUT_EP  0x03  /* bulk OUT */
-#define MC707_MIDI_IN_EP   0x84  /* bulk IN */
+/* Interrupt MIDI endpoints live on iface 3 alt 1. We use the interrupt
+ * transport (NOT the bulk transport on alt 0) because upstream's
+ * snd_usbmidi_switch_roland_altsetting() — triggered for any Roland
+ * vendor (0x0582) with 2 altsettings — forcibly switches to alt 1 when
+ * alt 1 has interrupt endpoints. Fighting that switch would mean lying
+ * about our vendor ID. bInterval=4 at high-speed → 1ms polling.
+ *
+ * IMPORTANT: out_ep/in_ep must be endpoint NUMBERS (low 4 bits), not
+ * addresses. struct snd_usb_midi_endpoint_info uses int8_t for these
+ * fields; if bit 7 is set (e.g. 0x85 for IN-EP-5), sign extension on
+ * int promotion sets bits 16-31, including bits 30-31 which encode
+ * pipe type. For PIPE_INTERRUPT (= 1) that corruption flips the
+ * encoded type to PIPE_BULK (= 3), and usb_urb_ep_type_check rejects
+ * the URB. (For PIPE_BULK the corruption is a no-op — which is why
+ * mainline quirks like `.in_ep = 0x82` happen to work for bulk MIDI.) */
+#define MC707_MIDI_OUT_EP    0x03  /* iface 3 alt 1, EP 3 OUT */
+#define MC707_MIDI_IN_EP     0x05  /* iface 3 alt 1, EP 5 IN  */
+#define MC707_MIDI_INTERVAL  4
 
 /* Per-device state. Anchored on interface 3 since that's currently the
  * only interface we attach to. M2/M3 will move this to a device-wide
@@ -42,11 +58,13 @@ struct mc707_card {
 };
 
 static const struct snd_usb_midi_endpoint_info mc707_midi_ep_info = {
-	.out_ep     = MC707_MIDI_OUT_EP,
-	.in_ep      = MC707_MIDI_IN_EP,
-	.out_cables = 0x0001,  /* 1 OUT cable — first hypothesis from
-				* class descriptor `06 24 f1 02 01 01`. */
-	.in_cables  = 0x0001,  /* 1 IN cable, same source. */
+	.out_ep       = MC707_MIDI_OUT_EP,
+	.out_interval = MC707_MIDI_INTERVAL,
+	.in_ep        = MC707_MIDI_IN_EP,
+	.in_interval  = MC707_MIDI_INTERVAL,
+	.out_cables   = 0x0001,  /* 1 OUT cable — class descriptor
+				  * `06 24 f1 02 01 01` (first hypothesis). */
+	.in_cables    = 0x0001,  /* 1 IN cable, same source. */
 };
 
 static const struct snd_usb_audio_quirk mc707_midi_quirk = {
@@ -64,6 +82,11 @@ static int mc707_probe_midi(struct usb_interface *intf,
 	struct mc707_card *mc;
 	struct snd_card *card;
 	int err;
+
+	/* Don't force alt 0. snd_usbmidi_switch_roland_altsetting() in
+	 * __snd_usbmidi_create() will switch us to alt 1 (interrupt EPs)
+	 * for any Roland device whose alt 1 advertises interrupt
+	 * endpoints — which is exactly our case. */
 
 	err = snd_card_new(&intf->dev, SNDRV_DEFAULT_IDX1, "MC707",
 			   THIS_MODULE, sizeof(*mc), &card);
