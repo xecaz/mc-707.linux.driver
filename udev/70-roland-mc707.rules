@@ -1,0 +1,4 @@
+# Roland MC-707 in vendor USB mode — give plugdev group RW so the driver
+# can be developed without sudo per insmod cycle. The audio group access is
+# what ALSA itself uses once the kernel module owns the device.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0582", ATTR{idProduct}=="0229", MODE="0660", GROUP="plugdev", TAG+="uaccess"
