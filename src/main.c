@@ -82,7 +82,8 @@ static int mc707_probe_midi(struct usb_interface *intf,
 
 	err = __snd_usbmidi_create(card, intf, &mc->midi_list,
 				   &mc707_midi_quirk,
-				   USB_ID(USB_VID_ROLAND, USB_PID_MC707));
+				   USB_ID(USB_VID_ROLAND, USB_PID_MC707),
+				   NULL /* num_rawmidis out-param; unused */);
 	if (err < 0) {
 		dev_err(&intf->dev,
 			"MC-707: __snd_usbmidi_create() failed: %d\n", err);
