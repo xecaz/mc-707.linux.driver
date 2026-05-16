@@ -183,6 +183,41 @@ Full list of distinct IOCTL constants:
 (Call-site VAs and full distribution captured in
 `tools/extract_ioctls.py` output — see "Reproducibility" below.)
 
+## RDWM1207.SYS surface (kernel driver) — initial pass
+
+The 24 user-mode IOCTLs recovered from `RDAS1207.DLL` are issued *into*
+the SYS driver, which then constructs URBs and forwards them to the
+parent USB bus driver. Initial CLI-only survey:
+
+**Imports**: `ntoskrnl.exe` (58 symbols — standard WDM:
+`IoAllocateIrp`, `IoBuildDeviceIoControlRequest`, `IofCallDriver`,
+`MmAllocateContiguousMemory`, `KeWaitForSingleObject`,
+`PsCreateSystemThread`, etc.) + `USBD.SYS` (just 2 symbols:
+`USBD_CreateConfigurationRequest`, `USBD_ParseConfigurationDescriptor`).
+
+**URB submission sites** (4 total, found by searching for the constant
+`IOCTL_INTERNAL_USB_SUBMIT_URB = 0x00220003`):
+
+| Helper fn VA       | Size | Direct callers | L2 ancestors (likely IOCTL handlers) |
+|--------------------|-----:|---------------:|--------------------------------------|
+| `0x14000e000`      |  186 B | 7 | 9 — likely the shared `SendVendorControl(bRequest, wValue, wIndex, buf, len)` |
+| `0x14001dd00`      |  128 B | 3 | 3 — secondary submit path |
+| `0x1400159e6`      |  432 B | 0 (called via fn-pointer) | — |
+| `0x140015bc8`      |  610 B | 0 (called via fn-pointer) | — |
+
+Two of the four are not called directly — they live in callback /
+function-pointer tables (consistent with the WDM completion-routine
+pattern, or with vtable dispatch). The other two have small,
+tractable caller graphs.
+
+**IOCTL constants in SYS**: only **4 of 24** appear as 4-byte
+immediates in `.text` (`0x002221e8`, `0x00222320`, `0x002223e8`,
+`0x002223ec`). The other 20 are not present anywhere as raw 4-byte
+constants. Most likely the dispatcher is compiled as a jump-table
+switch where MSVC emits only the BASE constant and a table of small
+deltas. Confirming this requires disassembly inspection — Ghidra
+will reconstruct the switch statement automatically.
+
 ## Open questions for the next RE pass
 
 1. ✅ **Partial**: 10 of 24 IOCTLs mapped to ASIO methods via direct-call
@@ -200,12 +235,21 @@ Full list of distinct IOCTL constants:
 3. **Identify the AsioOurs / CDevOne vtable.** Likely at the start of
    `.data` (we already saw GUID + function pointers at `.data+0x00`).
    Resolving the vtable would close the remaining 14 IOCTLs.
-4. **Reverse the same surface in `RDWM1207.SYS`** to confirm
-   IOCTL → URB mapping. The IOCTL is just the user/kernel boundary;
-   the actual USB vendor control transfer is built inside the SYS
-   driver. Look for `URB_FUNCTION_VENDOR_DEVICE` /
-   `URB_FUNCTION_CONTROL_TRANSFER_EX` URB construction patterns. SYS
-   is 2.5× the size of the DLL (397 KB) — Ghidra-only territory.
+4. ✅ **Partial**: SYS surveyed. 4 URB submission sites found.
+   Outstanding pieces (all Ghidra-only from here):
+   - Map each IOCTL → URB helper. The L2-caller sets we have (9 + 3
+     functions) are candidates for the per-IOCTL handlers; need to
+     decompile each to see which IOCTL it dispatches and what
+     SetupPacket it builds.
+   - Recover the IOCTL dispatcher itself (jump-table switch).
+   - URB initialization is opaque to byte-pattern matching — Roland
+     probably memcpy's from a static URB template in `.rdata` or
+     `.data`. Need to see the static template content and what
+     bRequest/wValue/wIndex bytes appear inside it.
+   - Then, finally, **the actual USB SetupPacket bytes** for the
+     critical operations (`canSampleRate` probe, `setSampleRate`,
+     `setClockSource`, `start`, `stop`) — those are what our Linux
+     driver needs to emit verbatim via `usb_control_msg()`.
 
 ## Microsoft public symbol server: not useful (confirmed)
 
