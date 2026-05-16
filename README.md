@@ -36,16 +36,27 @@ which we expect to be the hardest piece (M3 below).
   channel 1). Uses upstream `snd-usbmidi-lib` via the exported
   `__snd_usbmidi_create()` with `QUIRK_MIDI_FIXED_ENDPOINT` over the
   interrupt-EP alt-setting (alt 1 of interface 3).
-- **M2 — Audio init sequence (no streaming)**: not started.
-  Setting sample rate / clock source via Roland's vendor control
-  transfers, alt-setting selection for the iso interfaces, descriptor
-  handshake. The Windows ASIO DLL (`RDAS1207.DLL`) exposes
-  `setClockSource(int)` even though the USB descriptors only advertise
-  44.1 kHz alt-settings — strongly suggesting vendor control transfers
-  carry that negotiation. RE target.
+- **M2 — Audio init sequence (no streaming)**:
+  🟢 **RE complete; implementation pending.** Static reverse-engineering
+  of `RDAS1207.DLL` and `RDWM1207.SYS` via headless Ghidra (12.0.3 +
+  PyGhidra) reached a surprisingly clean conclusion: **the audio
+  interfaces are UAC1-shaped under the vendor-class wrapper.** Iface 1
+  alt 1 and iface 2 alt 1 both carry standard UAC1 Type I Format
+  descriptors (`0b 24 02 01 06/14 04 18 01 44 ac 00`) — 6/20 channels ×
+  24-bit × 44.1 kHz. The Windows driver uses PortClass for stream
+  management, and the entire SYS binary has only ONE vendor control
+  transfer at the URB layer (an auxiliary daemon-only command, not
+  audio-init related). There is no Roland-specific audio-init protocol
+  to reverse — implementation reduces to: claim ifaces 1+2, parse as
+  UAC1, set up ALSA pcm substreams, use standard UAC1 sample-rate
+  control transfers if needed. Full notes:
+  [`notes/audio-init.md`](notes/audio-init.md) and the Ghidra
+  post-scripts in [`notes/ghidra-extract-*.py`](notes/).
 - **M3 — Multichannel audio streaming with implicit feedback**: not started.
-  6-channel iso OUT + 20-channel iso IN, with the IN endpoint also
-  carrying implicit feedback timing for the OUT stream. The hard piece.
+  6-channel iso OUT (EP `0x0D`, 160 B/packet) + 20-channel iso IN
+  (EP `0x8E`, 524 B/packet), with the IN endpoint also carrying
+  implicit feedback timing for the OUT stream. The hard piece — same
+  spot where the AIRA TR-8 community attempt stalled in 2015.
 
 See the detailed roadmap in
 [`/home/xecaz/code/mc707/CLAUDE.md`](../mc707/CLAUDE.md), the full plan
@@ -101,9 +112,12 @@ per-track MIDI receive page.
 ## Layout
 
 - `src/` — kernel module source.
-- `udev/70-roland-mc707.rules` — gives `plugdev` users RW on the device.
-- `notes/` — reverse-engineering notes against the Windows driver binaries in
-  `../mc707/mc707_w1011d_v101DL/`.
+- `udev/70-roland-mc707.rules` — udev rule granting `plugdev` users RW.
+- `notes/` — reverse-engineering write-ups against the Windows driver binaries:
+  - `usb-descriptors.md` — full descriptor breakdown (live `lsusb -v` capture).
+  - `ioctls.md` — DLL → SYS DeviceIoControl surface (day-1 survey).
+  - `audio-init.md` — M2 RE: sample-rate table, IOCTL ↔ ASIO-method mapping, IOCTL buffer sizes, IOCTL dispatcher reconstruction, complete URB inventory, and the UAC1-underneath conclusion.
+  - `ghidra-extract-urb.py` / `ghidra-extract-handlers.py` / `ghidra-extract-urb-broad.py` — headless Ghidra post-scripts (PyGhidra) for reproducing the M2 RE pass.
 
 ## Reverse-engineering reference material
 
@@ -113,3 +127,26 @@ input to Ghidra. The PDB path leaked in `RDWM1207.SYS`
 (`...usbdrv8oq\Sys\sysw10\x64\207\RDWM1207Full.pdb`) identifies Roland's 8th-gen
 shared USB driver framework — protocol details discovered here are expected to
 generalize to other AIRA/Boutique/Studio-Capture devices using `usbdrv8*`.
+
+### Reproducing the RE pass
+
+The notes folder contains three Python post-scripts for headless Ghidra (12.x +
+PyGhidra). To re-run them against the Windows binaries:
+
+```
+# 1. Set up PyGhidra in a venv (one-time).
+python3 -m venv ~/.venv-ghidra
+~/.venv-ghidra/bin/pip install \
+    $GHIDRA_HOME/Ghidra/Features/PyGhidra/pypkg/dist/pyghidra-*.whl
+
+# 2. Import + auto-analyze the SYS driver.
+$GHIDRA_HOME/support/analyzeHeadless ~/ghidra-projects/mc707 mc707 \
+    -import /path/to/RDWM1207.SYS -overwrite -loader PeLoader
+
+# 3. Run an extraction script.
+~/.venv-ghidra/bin/python \
+    $GHIDRA_HOME/Ghidra/Features/PyGhidra/support/pyghidra_launcher.py \
+    $GHIDRA_HOME -H ~/ghidra-projects/mc707 mc707 \
+    -process RDWM1207.SYS -noanalysis \
+    -scriptPath ./notes -postScript ghidra-extract-urb.py
+```
