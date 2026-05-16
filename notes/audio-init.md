@@ -73,6 +73,102 @@ Most-called IOCTLs (in descending call-site count):
 | `0x00222124` |   3×  | TBD |
 | ... 19 others, 1–2 calls each ... | |
 
+### Per-IOCTL buffer size (statically recoverable)
+
+Roland uses `METHOD_BUFFERED` with **`in_size == out_size`** at almost every
+call site — request/reply with the same struct, input is overwritten by
+the response. Sizes were recovered by walking back ≤120 bytes from each
+`DeviceIoControl` call and matching:
+
+- `41 B9 imm32` → `mov r9d, imm32` (nInBufferSize)
+- `45 33 C9`    → `xor r9d, r9d`   (nInBufferSize = 0; null input buffer)
+- `C7 44 24 28 imm32` → `mov dword ptr [rsp+0x28], imm32` (nOutBufferSize)
+
+When the immediate-load idiom isn't used (size computed at runtime), `???`
+is shown.
+
+| IOCTL        | in / out (B) | First-guess role |
+|--------------|--------------|------------------|
+| `0x0022203c` | 2056 / 2056  | **largest** — firmware blob? device config block? |
+| `0x00222040` |    8 /    8  | pair of u32s |
+| `0x00222044` |    0 /    4  | no-input query → u32 result |
+| `0x00222048` |    4 /    4  | u32 in/out (toggle / set-mode?) |
+| `0x0022211c` |   24 /   24  | **stream start** (called by `AsioOurs::start`) |
+| `0x00222120` |   12 /   12  | three u32s |
+| `0x00222124` |    0 / ???   | no-input query (4 separate call sites) |
+| `0x00222128` |   12 /   12  | three u32s — reached by getLatencies, setSampleRate |
+| `0x00222130` |   16 /   16  | **4-method common-query** — createBuffers, getBufferSize, getLatencies, setSampleRate |
+| `0x00222138` |  ??? /    8  | pair of u32s |
+| `0x0022213c` |   16 /   16  | four u32s |
+| `0x00222140` |   32 /   32  | **CDevOne::CreateBuffer per-buffer alloc** |
+| `0x00222150` |  ??? /   48  | larger config block |
+| `0x00222154` |   48 /   48  | larger config block (called 4× — common operation) |
+| `0x00222158` |    8 /    8  | pair of u32s |
+| `0x0022215c` |   32 /   32  | eight u32s — used by setSampleRate |
+| `0x002221e8` |  340 /  340  | **most-called IOCTL (×5)** — full device state struct? |
+| `0x00222320` |    8 /    8  | pair of u32s |
+| `0x00222324` |    8 /    8  | called 2× — used by setSampleRate |
+| `0x00222348` |    4 /    4  | u32 — used by setSampleRate |
+| `0x002223e8` |   12 /   12  | three u32s — used by setSampleRate (×3 sites) |
+| `0x002223ec` |   12 /   12  | **canSampleRate probe** — `{rate, clock_src, ?}` |
+| `0x002223f0` |  ??? /    8  | pair of u32s |
+| `0x002223f4` |  ??? /    8  | pair of u32s — used by setSampleRate |
+
+The 340-byte payload of `0x002221e8` is intriguing. 340 = `0x154` — not
+a clean multiple of the sample-rate-table entry size (28 B), but
+9×28+88 = 340 (i.e., 9 rate entries + an 88-byte header). Plausibly
+"give me the full device capability dump including supported rates"
+returned as a parallel of the sample-rate table we found in `.data`.
+RE the SYS side to confirm.
+
+### IOCTL → ASIO method (call-graph BFS, direct calls only)
+
+By BFS from each named C++ entry point (15 found, only `AsioOurs::*` and
+one `CDevOne::CreateBuffer`) through `call rel32` / `jmp rel32` edges:
+
+| IOCTL        | Reached from |
+|--------------|--------------|
+| `0x0022211c` | `AsioOurs::start` |
+| `0x00222128` | `AsioOurs::getLatencies`, `AsioOurs::setSampleRate` |
+| `0x00222130` | `AsioOurs::createBuffers`, `AsioOurs::getBufferSize`, `AsioOurs::getLatencies`, `AsioOurs::setSampleRate` |
+| `0x00222140` | `CDevOne::CreateBuffer` |
+| `0x0022215c` | `AsioOurs::setSampleRate` |
+| `0x00222324` | `AsioOurs::setSampleRate` |
+| `0x00222348` | `AsioOurs::setSampleRate` |
+| `0x002223e8` | `AsioOurs::setSampleRate` |
+| `0x002223ec` | `AsioOurs::canSampleRate`, `AsioOurs::setSampleRate` |
+| `0x002223f4` | `AsioOurs::setSampleRate` |
+
+Observations:
+
+- **`AsioOurs::setSampleRate` is the heaviest method** — touches 8 IOCTLs
+  (`128, 130, 15c, 324, 348, 3e8, 3ec, 3f4`). That's likely the full
+  clock-change sequence: validate → quiesce → set → confirm.
+- **`0x002223ec`** is the "is-rate-supported" probe — called from both
+  `canSampleRate` (obviously) and `setSampleRate` (validates first).
+- **`0x0022211c` is "start streaming"** — exclusive to `AsioOurs::start`.
+- **`0x00222140` is "create one buffer"** — exclusive to `CDevOne::CreateBuffer`.
+  Plural-`createBuffers` (the ASIO entry) uses a different IOCTL
+  (`0x00222130`); likely a setup vs. per-buffer split.
+- **14 IOCTLs are not reached** from any named ASIO method via direct
+  calls: `0x0022203c, 0x00222040, 0x00222044, 0x00222048, 0x0022211c (also reached above), 0x00222120, 0x00222124, 0x00222138, 0x0022213c, 0x00222150, 0x00222154, 0x00222158, 0x002221e8, 0x00222320, 0x002223f0`.
+  These are almost certainly reached through:
+  1. **Vtable-indirect calls** (`call [reg+offset]`) which our scanner
+     doesn't trace. The device-side object (`CDevOne`) has a vtable;
+     methods like `setClockSource`, `disposeBuffers`, `getClockSources`
+     do not reach any IOCTL in our BFS, which is impossible — they
+     must go through the vtable.
+  2. **Constructor / destructor / init paths** (no log string).
+  3. **Background poller / audio thread** issuing
+     `0x002221e8` × 5 (the most-called IOCTL) — consistent with a
+     status-poll loop.
+  Mapping these requires vtable analysis (Ghidra-friendly, CLI-painful).
+- **Methods that show "no DeviceIoControl reached" in the BFS but
+  clearly need to talk to the device**: `setClockSource`,
+  `getClockSources`, `getSampleRate`, `getChannelInfo`, `getChannels`,
+  `disposeBuffers`, `stop`. All of these almost certainly dispatch via
+  vtable.
+
 Full list of distinct IOCTL constants:
 
 ```
@@ -89,23 +185,27 @@ Full list of distinct IOCTL constants:
 
 ## Open questions for the next RE pass
 
-1. **Map each IOCTL → C++ method**. The 13 known `AsioOurs::*` methods
-   (`canSampleRate`, `setSampleRate`, `getSampleRate`, `getClockSources`,
-   `setClockSource`, `getChannels`, `getChannelInfo`, `getLatencies`,
-   `getBufferSize`, `createBuffers`, `disposeBuffers`, `start`, `stop`)
-   need to be associated with the IOCTLs they issue. Approach:
-   - Walk `.pdata` to get function ranges.
-   - For each function, find the `lea rcx, [rip+disp]` that loads its
-     log format string — that names the function.
-   - Cross-tabulate: function range ↔ IOCTLs ↔ method name.
-2. **Recover the input-buffer struct** for the IOCTLs that look like
-   "set sample rate" and "set clock source". These structs are what
-   the kernel driver eventually maps to vendor control transfers.
-3. **Reverse the same surface in `RDWM1207.SYS`** to confirm
-   IOCTL → URB mapping (the IOCTL is just the user/kernel boundary;
-   the actual USB transfer is built inside the SYS driver). Look for
-   `URB_FUNCTION_VENDOR_DEVICE` / `URB_FUNCTION_CONTROL_TRANSFER_EX`
-   construction.
+1. ✅ **Partial**: 10 of 24 IOCTLs mapped to ASIO methods via direct-call
+   BFS (see table above). The remaining 14 are reached through
+   vtable-indirect calls (`call qword ptr [reg+offset]`) which our
+   CLI scanner cannot resolve. Ghidra handles vtables natively.
+2. **Recover the input/output-buffer struct** for the mapped IOCTLs.
+   At each `DeviceIoControl` call site:
+   - `R8` holds `lpInBuffer` (loaded via `lea r8, [...]`)
+   - `R9d` holds `nInBufferSize` (`mov r9d, imm`)
+   - `[rsp+0x20]` holds `lpOutBuffer`, `[rsp+0x28]` holds `nOutBufferSize`
+   These are statically discoverable by walking back ~120 bytes from
+   each call. Highest value: `0x002223ec` (canSampleRate test) — its
+   in-buffer struct probably holds `{rate, clock_source}` or similar.
+3. **Identify the AsioOurs / CDevOne vtable.** Likely at the start of
+   `.data` (we already saw GUID + function pointers at `.data+0x00`).
+   Resolving the vtable would close the remaining 14 IOCTLs.
+4. **Reverse the same surface in `RDWM1207.SYS`** to confirm
+   IOCTL → URB mapping. The IOCTL is just the user/kernel boundary;
+   the actual USB vendor control transfer is built inside the SYS
+   driver. Look for `URB_FUNCTION_VENDOR_DEVICE` /
+   `URB_FUNCTION_CONTROL_TRANSFER_EX` URB construction patterns. SYS
+   is 2.5× the size of the DLL (397 KB) — Ghidra-only territory.
 
 ## Microsoft public symbol server: not useful (confirmed)
 
