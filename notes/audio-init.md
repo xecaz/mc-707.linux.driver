@@ -218,6 +218,100 @@ switch where MSVC emits only the BASE constant and a table of small
 deltas. Confirming this requires disassembly inspection — Ghidra
 will reconstruct the switch statement automatically.
 
+## RDWM1207.SYS internals — Ghidra decompile pass
+
+Headless Ghidra (12.0.3 + PyGhidra) revealed the SYS architecture.
+
+### The driver is PortClass-based, not a raw USB function driver
+
+`DriverEntry` (real one at VA `0x140013890`, called from PE entry
+`0x140061000`) calls **`PcInitializeAdapterDriver`** — that's
+`PortCls.sys` (Microsoft's audio driver framework). Implications:
+
+- IRP dispatching uses PortCls's framework, not raw `MajorFunction[]`.
+- Stream IRPs go through `PcDispatchIrp` (visible in the unified MJ
+  handler).
+- The MC-707's audio side is exposed as a KS (Kernel Streaming)
+  device, not a custom USB device. Roland still issues vendor control
+  transfers via URBs, but the Windows-side application path is
+  PortCls / KS — different from how our Linux ALSA driver works
+  (we're more like a USB-class function driver). The protocol bytes
+  on the wire should still be the same regardless.
+
+A side-find: the driver hard-codes `_DAT_14005e2dc = 0xac44 = 44100`
+during `DriverEntry`. So the device default is 44.1 kHz — matches the
+USB descriptor's advertised rate.
+
+### Unified MajorFunction handler: `FUN_140013b50`
+
+Assigned to MajorFunctions for CREATE, CLOSE, DEVICE_CONTROL, POWER,
+PNP — all routed to the same function. Inside, the first byte of the
+`IO_STACK_LOCATION` (the MajorFunction code) is read and dispatched:
+
+- `0x0e` (`IRP_MJ_DEVICE_CONTROL`) → **`FUN_140005a60`** ← the IOCTL dispatcher
+- `0x16` (`IRP_MJ_POWER`) → state transitions + `PcDispatchIrp`
+- `0x1b` (`IRP_MJ_PNP`) → PnP minor handling + `PcDispatchIrp`
+- `0x00` (`IRP_MJ_CREATE`) → ref-count increment
+- `0x02` (`IRP_MJ_CLOSE`) → `FUN_140012650`
+
+For `IRP_MJ_DEVICE_CONTROL`, it acquires a wait-mutex
+(`KeWaitForSingleObject(lVar2 + 0x4a39a0, ...)`) before calling
+`FUN_140005a60`, then signals it. So **IOCTL handling is serialized
+device-wide** — no concurrent IOCTLs in flight.
+
+### IOCTL dispatcher: `FUN_140005a60`
+
+A clean three-way switch over the `IoControlCode`. Internal cases
+group the 24 user-visible IOCTLs (plus ~13 more we hadn't seen from
+the DLL — probably for other tools or sibling products in the
+`usbdrv8oq` family) into three sub-handlers:
+
+| Sub-handler | IOCTL count | Role guess | Cases (full set) |
+|-------------|------------:|-----------|------------------|
+| `FUN_14000e210` (caller ctx = `lVar2+0x30`) | 13 | **Queries** (read state) | `0x222034, 0x222038, 0x22203c, 0x222040, 0x222044, 0x222048, 0x22204c, 0x2221e8, 0x2221ec, 0x2221f8, 0x222640, 0x222644, 0x222648` |
+| `FUN_1400169b0` (caller ctx = `lVar2+0xad50`) | 22 | **Control surface** (state mutations) | `0x222134, 0x22211c, 0x222120, 0x222124, 0x222128, 0x22212c, 0x222130, 0x222138, 0x22213c, 0x222140, 0x222144, 0x222150, 0x222154, 0x222158, 0x22215c, 0x222160, 0x222167, 0x2223e8, 0x2223ec, 0x2223f0, 0x2223f4` |
+| `FUN_14001fb20` (caller ctx = `lVar2+0xad50`) | 9 | **Stream / PortClass-routed** | `0x222050, 0x222320, 0x222324, 0x222328, 0x22232c, 0x222340, 0x222344, 0x222348` |
+
+So the IOCTL → handler mapping is now resolved. Cross-referenced
+with what we know from the DLL side: `setSampleRate`'s 8 IOCTLs
+(`128, 130, 15c, 324, 348, 3e8, 3ec, 3f4`) split between
+`FUN_1400169b0` (the four `3e8..3f4` + `128`, `130`, `15c`) and
+`FUN_14001fb20` (`324, 348`). Confirms our guess that setSampleRate
+does both a control-surface mutation AND a PortClass-coordinated
+stream rate change.
+
+### URB submission: `FUN_14000e000` (sync) and `FUN_14001dd00` (async)
+
+The decompile makes the pattern explicit. The **sync** submit:
+
+```c
+ulonglong urb_submit_sync(DEVICE_EXT *ext, URB *urb) {
+    KEVENT done; KeInitializeEvent(&done, NotificationEvent, FALSE);
+    IO_STATUS_BLOCK iosb;
+    PIRP irp = IoBuildDeviceIoControlRequest(
+        IOCTL_INTERNAL_USB_SUBMIT_URB,    // 0x00220003
+        ext->parent_usb_DO,                // [ext+0x180]
+        NULL, 0, NULL, 0,                  // no buffers
+        TRUE,                              // InternalDeviceIoControl
+        &done, &iosb);
+    irp->Tail.Overlay.CurrentStackLocation->Parameters.Others.Argument1 = urb;
+    NTSTATUS s = IofCallDriver(ext->parent_usb_DO, irp);
+    if (s == STATUS_PENDING) {
+        KeWaitForSingleObject(&done, Executive, KernelMode, FALSE, NULL);
+        s = iosb.Status;
+    }
+    return s;
+}
+```
+
+The **async** version pre-allocates the IRP (`IoReuseIrp`), sets up
+a completion routine (`FUN_1400163b0`), and returns immediately.
+
+**Critical: the URB itself is built by the CALLERS, not in these
+helpers.** So the SetupPacket bytes (bRequestType, bRequest, wValue,
+wIndex) live one layer up — in the functions that call these helpers.
+That's the next decompile target.
+
 ## Open questions for the next RE pass
 
 1. ✅ **Partial**: 10 of 24 IOCTLs mapped to ASIO methods via direct-call
