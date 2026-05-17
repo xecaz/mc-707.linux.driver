@@ -59,13 +59,36 @@
 #define MC707_OUT_CHANNELS     6
 #define MC707_IN_CHANNELS      20
 
+/* Iso streaming parameters. 4 URBs × 8 packets/URB = 4 ms initial
+ * latency at high-speed. Each microframe carries 5 or 6 sample-frames
+ * per the 44100/8000 pacing residue counter. */
+#define MC707_URB_COUNT          4
+#define MC707_PACKETS_PER_URB    8
+
 /* Per-substream state: which USB interface backs this PCM substream,
  * what alt we're currently on, and (once alt 1 is active) the iso
- * endpoint descriptor we'll feed to URBs in M3. */
+ * endpoint descriptor we feed to URBs in M3. */
 struct mc707_substream {
 	struct usb_interface         *intf;        /* iface 1 (out) or 2 (in) */
 	struct usb_endpoint_descriptor *ep_desc;   /* set after alt switch */
 	bool                          alt_active;  /* alt 1 vs alt 0 */
+
+	/* PCM-thread / completion link */
+	struct snd_pcm_substream     *substream;   /* set in pcm_open */
+	bool                          running;     /* true between trigger START/STOP */
+
+	/* URB ring for iso transfers. Allocated in hw_params, freed in hw_free.
+	 * Each URB owns one usb_alloc_coherent'd buffer big enough to hold
+	 * MC707_PACKETS_PER_URB worst-case-sized packets. buf_size is
+	 * stashed here so urbs_free doesn't depend on ep_desc still being
+	 * valid — disconnect can clear ep_desc before hw_free runs. */
+	struct urb                   *urbs[MC707_URB_COUNT];
+	size_t                        urb_buf_size;
+
+	/* Pacing residue for 44100/8000: each packet, increment by 44100;
+	 * if ≥ 8000 emit 6 sample-frames and subtract 8000, else emit 5.
+	 * Across 8000 packets that sums to exactly 44100 sample-frames. */
+	unsigned int                  pacing_residue;
 };
 
 /* Per-USB-device state. One mc707_dev exists per plugged MC-707,
@@ -236,6 +259,139 @@ static void mc707_deactivate_alt(struct mc707_substream *sub,
 	sub->alt_active = false;
 }
 
+/* ===== URB engine (M3 step 1: silence-only, no ALSA buffer touch) =========
+ *
+ * Pacing: 44100 sample-frames/sec spread across 8000 microframes/sec.
+ * Residue counter: add 44100 per packet, emit 6 frames when ≥8000 then
+ * subtract 8000, else emit 5. Averages exactly 5.5125 sample-frames per
+ * microframe across each second.
+ */
+
+static unsigned int mc707_frames_for_packet(struct mc707_substream *sub)
+{
+	sub->pacing_residue += MC707_RATE;
+	if (sub->pacing_residue >= 8000) {
+		sub->pacing_residue -= 8000;
+		return 6;
+	}
+	return 5;
+}
+
+static void mc707_urb_complete_out(struct urb *urb);
+
+/* Free all URBs and their DMA buffers. Safe to call on partially-built
+ * rings (entries may be NULL) and on URBs still queued at the HCD
+ * (kill_urb waits for completion synchronously). */
+static void mc707_urbs_free(struct mc707_substream *sub, struct mc707_dev *d)
+{
+	int i;
+
+	for (i = 0; i < MC707_URB_COUNT; i++) {
+		struct urb *urb = sub->urbs[i];
+		if (!urb)
+			continue;
+		usb_kill_urb(urb);
+		if (urb->transfer_buffer && sub->urb_buf_size)
+			usb_free_coherent(d->udev, sub->urb_buf_size,
+					  urb->transfer_buffer, urb->transfer_dma);
+		usb_free_urb(urb);
+		sub->urbs[i] = NULL;
+	}
+	sub->urb_buf_size = 0;
+}
+
+/* Allocate URBs + transfer buffers sized for the iso endpoint's max packet.
+ * Pipe and per-packet descriptors are (re)set in mc707_pcm_prepare. */
+static int mc707_urbs_alloc(struct mc707_substream *sub, struct mc707_dev *d)
+{
+	unsigned int mps;
+	int i;
+
+	if (!sub->ep_desc)
+		return -ENODEV;
+
+	mps = usb_endpoint_maxp(sub->ep_desc);
+	sub->urb_buf_size = mps * MC707_PACKETS_PER_URB;
+
+	for (i = 0; i < MC707_URB_COUNT; i++) {
+		struct urb *urb;
+		void *buf;
+
+		urb = usb_alloc_urb(MC707_PACKETS_PER_URB, GFP_KERNEL);
+		if (!urb)
+			goto fail;
+
+		buf = usb_alloc_coherent(d->udev, sub->urb_buf_size, GFP_KERNEL,
+					 &urb->transfer_dma);
+		if (!buf) {
+			usb_free_urb(urb);
+			goto fail;
+		}
+		urb->transfer_buffer = buf;
+		urb->dev             = d->udev;
+		urb->number_of_packets = MC707_PACKETS_PER_URB;
+		urb->context         = sub;
+		urb->complete        = mc707_urb_complete_out;
+		urb->transfer_flags  = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
+		sub->urbs[i] = urb;
+	}
+	return 0;
+
+fail:
+	mc707_urbs_free(sub, d);
+	return -ENOMEM;
+}
+
+/* Fill one URB's iso packet descriptors + payload from the pacing counter.
+ * Step 1: payload is silence (memset 0). */
+static void mc707_urb_fill_silence(struct urb *urb, struct mc707_substream *sub,
+				   bool is_playback)
+{
+	unsigned int offset = 0;
+	unsigned int bytes_per_frame = (is_playback ? MC707_OUT_CHANNELS
+						    : MC707_IN_CHANNELS)
+				       * MC707_SUBFRAME_BYTES;
+	int i;
+
+	for (i = 0; i < urb->number_of_packets; i++) {
+		unsigned int frames = mc707_frames_for_packet(sub);
+		unsigned int bytes  = frames * bytes_per_frame;
+
+		urb->iso_frame_desc[i].offset = offset;
+		urb->iso_frame_desc[i].length = bytes;
+		urb->iso_frame_desc[i].status = 0;
+		urb->iso_frame_desc[i].actual_length = 0;
+		offset += bytes;
+	}
+	urb->transfer_buffer_length = offset;
+	memset(urb->transfer_buffer, 0, offset);
+}
+
+static void mc707_urb_complete_out(struct urb *urb)
+{
+	struct mc707_substream *sub = urb->context;
+	int err;
+
+	/* Shutdown / kill paths — just stop. */
+	if (urb->status == -ESHUTDOWN || urb->status == -ENOENT ||
+	    urb->status == -EINTR    || urb->status == -ECONNRESET)
+		return;
+
+	if (urb->status)
+		dev_warn_ratelimited(&urb->dev->dev,
+				     "MC-707: iso URB status %d\n", urb->status);
+
+	if (!READ_ONCE(sub->running))
+		return;
+
+	mc707_urb_fill_silence(urb, sub, /*is_playback=*/true);
+
+	err = usb_submit_urb(urb, GFP_ATOMIC);
+	if (err && err != -ESHUTDOWN)
+		dev_err_ratelimited(&urb->dev->dev,
+				    "MC-707: iso URB resubmit failed: %d\n", err);
+}
+
 static int mc707_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -246,9 +402,17 @@ static int mc707_pcm_open(struct snd_pcm_substream *substream)
 
 	runtime->hw = playback ? mc707_pcm_hw_playback : mc707_pcm_hw_capture;
 
+	/* M3 step 1: only playback. Capture stays as a stub. */
+	if (!playback)
+		return 0;
+
 	err = mc707_activate_alt(sub, d, playback);
 	if (err < 0)
 		return err;
+
+	sub->substream      = substream;
+	sub->running        = false;
+	sub->pacing_residue = 0;
 	return 0;
 }
 
@@ -257,6 +421,7 @@ static int mc707_pcm_close(struct snd_pcm_substream *substream)
 	struct mc707_dev *d = substream->pcm->private_data;
 	struct mc707_substream *sub = mc707_sub_for(substream);
 
+	sub->substream = NULL;
 	mc707_deactivate_alt(sub, d);
 	return 0;
 }
@@ -264,29 +429,98 @@ static int mc707_pcm_close(struct snd_pcm_substream *substream)
 static int mc707_pcm_hw_params(struct snd_pcm_substream *substream,
 			       struct snd_pcm_hw_params *params)
 {
-	return 0;
+	struct mc707_dev *d = substream->pcm->private_data;
+	struct mc707_substream *sub = mc707_sub_for(substream);
+
+	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+		return 0;
+
+	/* If a previous hw_params built a ring, drop it first. */
+	mc707_urbs_free(sub, d);
+	return mc707_urbs_alloc(sub, d);
 }
 
 static int mc707_pcm_hw_free(struct snd_pcm_substream *substream)
 {
+	struct mc707_dev *d = substream->pcm->private_data;
+	struct mc707_substream *sub = mc707_sub_for(substream);
+
+	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+		return 0;
+
+	/* Make sure no URBs are still in flight from a previous run. */
+	WRITE_ONCE(sub->running, false);
+	mc707_urbs_free(sub, d);
 	return 0;
 }
 
 static int mc707_pcm_prepare(struct snd_pcm_substream *substream)
 {
+	struct mc707_substream *sub = mc707_sub_for(substream);
+	struct mc707_dev *d = substream->pcm->private_data;
+	bool playback = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
+	int i;
+
+	if (!playback)
+		return 0;
+
+	/* Re-derive pipe + per-packet descriptors from the active EP. */
+	for (i = 0; i < MC707_URB_COUNT; i++) {
+		struct urb *urb = sub->urbs[i];
+		if (!urb)
+			return -ENODEV;
+		urb->pipe     = usb_sndisocpipe(d->udev,
+					        usb_endpoint_num(sub->ep_desc));
+		urb->interval = 1;   /* every microframe (high-speed bInterval=1) */
+		mc707_urb_fill_silence(urb, sub, playback);
+	}
+	sub->pacing_residue = 0;
 	return 0;
 }
 
 static int mc707_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	/* M2: no streaming yet; M3 will wire up iso URBs here. */
-	dev_warn_once(substream->pcm->card->dev,
-		      "MC-707: PCM trigger requested but streaming is not implemented (M3)\n");
-	return -ENOSYS;
+	struct mc707_substream *sub = mc707_sub_for(substream);
+	int i, err;
+
+	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+		return -ENOSYS;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		WRITE_ONCE(sub->running, true);
+		for (i = 0; i < MC707_URB_COUNT; i++) {
+			err = usb_submit_urb(sub->urbs[i], GFP_ATOMIC);
+			if (err) {
+				dev_err(&sub->intf->dev,
+					"MC-707: iso URB[%d] submit failed: %d\n",
+					i, err);
+				WRITE_ONCE(sub->running, false);
+				/* Cancel any already-queued URBs. */
+				while (--i >= 0)
+					usb_kill_urb(sub->urbs[i]);
+				return err;
+			}
+		}
+		return 0;
+
+	case SNDRV_PCM_TRIGGER_STOP:
+		WRITE_ONCE(sub->running, false);
+		for (i = 0; i < MC707_URB_COUNT; i++)
+			usb_kill_urb(sub->urbs[i]);
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
 }
 
 static snd_pcm_uframes_t mc707_pcm_pointer(struct snd_pcm_substream *substream)
 {
+	/* Step 1 returns 0 — no real ALSA-buffer tracking yet. ALSA will
+	 * see no progress and aplay will eventually time out, but URBs
+	 * are still going out on the wire and we can observe device
+	 * behavior in dmesg / a USB analyzer. Step 2 will wire this up. */
 	return 0;
 }
 
@@ -504,14 +738,36 @@ static void mc707_disconnect(struct usb_interface *intf)
 		 "MC-707 disconnect: ifnum %u (refcount %d → %d)\n",
 		 ifnum, d->intf_refcount, d->intf_refcount - 1);
 
+	/* Defensive: kill any in-flight iso URBs on BOTH audio substreams
+	 * before anything else. Disconnect order isn't guaranteed (we may
+	 * be called for iface 3 first while ifaces 1/2 still have URBs
+	 * queued), and a torn-down audio path with live URBs racing the
+	 * MIDI disconnect has been observed to wedge the device hard
+	 * enough that `snd_usbmidi_disconnect → __timer_delete_sync`
+	 * hangs forever and the box needs a reboot. Always kill our URBs
+	 * first regardless of which interface we're being disconnected
+	 * for. usb_kill_urb is safe on never-submitted or already-killed
+	 * URBs. */
+	{
+		struct mc707_substream *subs[] = { &d->playback, &d->capture };
+		int s, k;
+		for (s = 0; s < ARRAY_SIZE(subs); s++) {
+			WRITE_ONCE(subs[s]->running, false);
+			for (k = 0; k < MC707_URB_COUNT; k++)
+				if (subs[s]->urbs[k])
+					usb_kill_urb(subs[s]->urbs[k]);
+		}
+	}
+
 	switch (ifnum) {
 	case MC707_MIDI_IFNUM:
 		snd_usbmidi_disconnect(&d->midi_list);
 		break;
 	case MC707_AUDIO_OUT_IFNUM:
 		/* Clear our pointer into this interface so PCM open can't
-		 * touch it after disconnect. The PCM itself stays alive
-		 * with the snd_card until the last interface is gone. */
+		 * touch it after disconnect. URBs were already killed above;
+		 * the URB structures and DMA buffers stay until pcm_hw_free
+		 * (or until the snd_card is freed below). */
 		d->playback.intf = NULL;
 		d->playback.ep_desc = NULL;
 		d->playback.alt_active = false;
