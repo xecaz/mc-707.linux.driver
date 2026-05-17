@@ -203,6 +203,15 @@ static int mc707_activate_alt(struct mc707_substream *sub,
 			playback ? "playback" : "capture");
 		return -ENODEV;
 	}
+	/* Sanity: this driver's iso pacing and interval assumptions are
+	 * built around high-speed (USB 2.0) framing. Refuse anything else
+	 * rather than submitting URBs with mismatched scheduling. */
+	if (d->udev->speed != USB_SPEED_HIGH) {
+		dev_err(&sub->intf->dev,
+			"MC-707: unsupported USB speed %d (expected HIGH)\n",
+			d->udev->speed);
+		return -EPROTONOSUPPORT;
+	}
 	if (sub->alt_active)
 		return 0;
 
@@ -377,9 +386,19 @@ static void mc707_urb_complete_out(struct urb *urb)
 	    urb->status == -EINTR    || urb->status == -ECONNRESET)
 		return;
 
-	if (urb->status)
-		dev_warn_ratelimited(&urb->dev->dev,
-				     "MC-707: iso URB status %d\n", urb->status);
+	/* Any other non-zero status: fatal-stop the stream. Do NOT resubmit.
+	 * Blindly resubmitting on every status caused a hard host-freeze in
+	 * session 4 (fact #17 in CLAUDE.md) — multiple URBs all in
+	 * resubmit-on-error loops in softirq context wedged the xHCI iso
+	 * scheduler. Mirrors snd-usb-audio: treat errors as xrun, stop.
+	 * Userspace will see the stream stall; better than a frozen box. */
+	if (urb->status) {
+		dev_err_ratelimited(&urb->dev->dev,
+				    "MC-707: iso URB status %d — stopping stream\n",
+				    urb->status);
+		WRITE_ONCE(sub->running, false);
+		return;
+	}
 
 	if (!READ_ONCE(sub->running))
 		return;
@@ -387,9 +406,12 @@ static void mc707_urb_complete_out(struct urb *urb)
 	mc707_urb_fill_silence(urb, sub, /*is_playback=*/true);
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
-	if (err && err != -ESHUTDOWN)
+	if (err) {
 		dev_err_ratelimited(&urb->dev->dev,
-				    "MC-707: iso URB resubmit failed: %d\n", err);
+				    "MC-707: iso URB resubmit failed: %d — stopping\n",
+				    err);
+		WRITE_ONCE(sub->running, false);
+	}
 }
 
 static int mc707_pcm_open(struct snd_pcm_substream *substream)
@@ -471,7 +493,17 @@ static int mc707_pcm_prepare(struct snd_pcm_substream *substream)
 			return -ENODEV;
 		urb->pipe     = usb_sndisocpipe(d->udev,
 					        usb_endpoint_num(sub->ep_desc));
-		urb->interval = 1;   /* every microframe (high-speed bInterval=1) */
+		/* Defensive cadence (session 4, fact #17): 8 microframes = 1 ms
+		 * per packet, instead of the descriptor's bInterval=1 (every
+		 * microframe). 8× slower; if the device errors every URB, we
+		 * get one completion per 8 ms per URB, not 1 ms. Combined
+		 * with the 1-URB throttle in trigger START this caps softirq
+		 * pressure absolutely. Pacing math (5/6 frames/packet for
+		 * 44100/8000) is intentionally NOT adjusted — we're emitting
+		 * silence to observe iso EP behavior, not produce audio.
+		 * Restore interval=1 and matching pacing once iso path is
+		 * proven safe. */
+		urb->interval = 8;
 		mc707_urb_fill_silence(urb, sub, playback);
 	}
 	sub->pacing_residue = 0;
@@ -489,14 +521,19 @@ static int mc707_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		WRITE_ONCE(sub->running, true);
-		for (i = 0; i < MC707_URB_COUNT; i++) {
+		/* Defensive throttle (session 4, fact #17): submit only ONE
+		 * URB on first iso contact. The other 3 stay allocated and
+		 * idle. Goal: see whether the device accepts an iso OUT URB
+		 * at all without overwhelming the HCD if it doesn't. Restore
+		 * the full ring (i < MC707_URB_COUNT) once the iso path is
+		 * proven survivable. */
+		for (i = 0; i < 1; i++) {
 			err = usb_submit_urb(sub->urbs[i], GFP_ATOMIC);
 			if (err) {
 				dev_err(&sub->intf->dev,
 					"MC-707: iso URB[%d] submit failed: %d\n",
 					i, err);
 				WRITE_ONCE(sub->running, false);
-				/* Cancel any already-queued URBs. */
 				while (--i >= 0)
 					usb_kill_urb(sub->urbs[i]);
 				return err;
@@ -550,6 +587,13 @@ static int mc707_create_pcm(struct mc707_dev *d)
 	strscpy(pcm->name, "MC-707", sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &mc707_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE,  &mc707_pcm_ops);
+
+	/* Userspace ring buffer (the one read by snd_pcm_lib_write etc.).
+	 * Distinct from our per-URB coherent buffers — this one is just where
+	 * write()/mmap data lands before pointer() advances. VMALLOC is fine
+	 * because no hardware DMA targets this buffer directly. Size 0 lets
+	 * ALSA pick a default and grow as hw_params requests. */
+	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 
 	d->pcm = pcm;
 	return 0;
